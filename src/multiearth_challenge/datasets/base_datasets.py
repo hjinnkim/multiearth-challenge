@@ -3,6 +3,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Un
 
 import numpy as np
 import xarray as xr
+import json
 
 import multiearth_challenge.datasets.data_filters as df
 import multiearth_challenge.datasets.relative_data_filters as rdf
@@ -544,3 +545,242 @@ class MultiEarthDatasetBase:
         ]
         target_data = self.target_data[target_idx["target_ds_idx"]][target_idx["target_img_idx"]]
         return (source_data, target_data)
+
+class MultiEarthDatasetBasePair: 
+    """A class for holding common logic used across MultiEarth dataset
+    classes.
+
+    """
+
+    def __init__(
+        self,
+        source_files: Sequence[Path],
+        target_files: Sequence[Path],
+        source_data_filters: Iterable[Callable[[xr.Dataset], Dict[str, np.ndarray]]] = [],
+        target_data_filters: Iterable[Callable[[xr.Dataset], Dict[str, np.ndarray]]] = [],
+        merge_source_bands: bool = False,
+        merge_target_bands: bool = False,
+        relative_date_filter: Optional[rdf.RelativeDateFilter] = None,
+        single_source_image: bool = True,
+        error_on_empty: bool = True,
+        dataset_json: str = None
+    ):
+        """Note, this initialization will open file handles to a NetCDF
+        file. These file handles are released by calling the close
+        member function of this class.
+
+        Parameters
+        ----------
+        source_files: Iterable[Path]
+            MultiEarth image NetCDF files whose data should be
+            considered for this dataset.
+
+        target_files: Iterable[Path]
+            MultiEarth NetCDF files whose images are considered truth
+            targets for this dataset. For example, deforestation masks
+            in an image segmentation task.
+
+        source_data_filters: Iterable[Callable[[xr.Dataset], Dict[str, np.ndarray]]], default=[]
+            A series of callables which specify what data held
+            within the passed MultiEarth NetCDF image files should be
+            included in this dataset. Each callable should return a
+            boolean mask for each sample held in a single NetCDF file
+            to indicate whether it should be included or
+            discarded. Standard filters date, position, and sensor
+            band are supplied in data_filters.py.
+
+        target_data_filters: Iterable[Callable[[xr.Dataset], Dict[str, np.ndarray]]], default=[]
+            A series of callables which specify what data held
+            within the passed MultiEarth NetCDF target files should be
+            included in this dataset.  Each callable should return a
+            boolean mask for each sample held in a single NetCDF file
+            to indicate whether it should be included or
+            discarded. Standard filters for date, position, and sensor
+            band are supplied in data_filters.py.
+
+        merge_source_bands: bool, default=False
+            If True, returned source images will have multiple
+            channels in increasing order of frequency (e.g., red,
+            green, blue for visible), co-pol before cross-pol, and
+            with bands not originating from collected imagery coming
+            last and in alphabetical order. The metadata returned with
+            the imagery will also specify the channel order. If False,
+            each band is treated as a separate sample.
+
+        merge_target_bands: bool, default=False
+            If True, returned target images will have multiple
+            channels in increasing order of frequency (e.g., red,
+            green, blue for visible), co-pol before cross-pol, and
+            with bands not originating from collected imagery coming
+            last and in alphabetical order. The metadata returned with
+            the imagery will also specify the channel order. If False,
+            each band is treated as a separate sample.
+
+        relative_date_filter: rdf.RelativeDateFilter, default=None
+            For a given target image, filters the imagery returned
+            with it based on its relative date. For example, for a
+            fire segmentation task you might specify that only
+            imagery collected within a week after the date associated
+            with the burn date be returned.
+
+        single_source_image: bool, default=True
+            If True, for each target image only a single source image
+            is returned in a unique pair. A single source image may be
+            paired with multiple target images and vice-versa
+            depending on data filters applied. If False, each target
+            image is returned with all source images at the same
+            location that satisfy applied data filters.
+
+        error_on_empty: bool, default=True
+            If True, if no source or target image remain after
+            data filtering, raise a ValueError, otherwise this dataset
+            will have length 0.
+
+        """
+        if not len(source_files):
+            raise ValueError(f"No source image files passed.")
+        if not len(target_files):
+            raise ValueError(f"No target image files passed.")
+        self.single_source_image = single_source_image
+        self.source_data = [
+            NetCDFDataset(ii, source_data_filters, merge_source_bands)
+            for ii in source_files
+        ]
+
+        self.relative_date_filter = relative_date_filter
+        self.target_data = [
+            NetCDFDataset(ii, target_data_filters, merge_target_bands)
+            for ii in target_files
+        ]
+
+        # Save mapping from absolute sample index to source and target
+        # indices to extract sample data from appropriate dataset
+        # locations.
+        # self.indices will hold a list of tuples where the first
+        # element is a list of source dataset / image indices and the
+        # second element is the target dataset / image index.
+                
+        if dataset_json is None:
+            self.indices = []
+            
+            for targ_ds_idx, targ_dataset in enumerate(self.target_data):
+                for targ_idx in range(len(targ_dataset)):
+                    for source_ds_idx, source_dataset in enumerate(self.source_data):
+                                                
+                        target_pos, target_date = targ_dataset.get_metadata(targ_idx)
+                        source_idxs = source_dataset.get_indices_by_loc(
+                            target_pos,
+                            self.relative_date_filter,
+                            target_date,
+                        )
+                        for source_idx in source_idxs:
+                            self.indices.append(
+                                (
+                                    {
+                                        "source_ds_idx": int(source_ds_idx),
+                                        "source_img_idx": int(source_idx),
+                                    },
+                                    {
+                                        "target_ds_idx": int(targ_ds_idx),
+                                        "target_img_idx": int(targ_idx),
+                                    },
+                                )
+                            )
+
+            if error_on_empty and not len(self.indices):
+                raise ValueError(f"After filtering, no common source and target data remains")
+            
+            # import os
+            # def save_json(path: str, data: list or dict):
+            #     
+            #     with open(path, 'w') as f:
+            #         json.dump(data, f, indent=2)
+            #     
+            #     print(f"save 'SARToVisiblePair.json' to the {path}")
+            # 
+            # source_data_dir = '.' if os.path.dirname(source_files[-1]) == '' else os.path.dirname(source_files[-1])
+            # save_json(f"{source_data_dir}/SARToVisiblePair.json", self.indices)
+            
+        else:
+            def load_json(path: str) -> list or dict:
+                with open(path, 'r') as f:
+                    _data = json.load(f)
+                return _data
+            self.indices = load_json(dataset_json)
+
+    def close(self) -> None:
+        """Closes the NetCDF file handles owned by this class."""
+        for data in self.source_data:
+            data.close()
+        for data in self.target_data:
+            data.close()
+
+    def __len__(self) -> int:
+        """Get the number of target samples in this dataset.
+
+        Returns
+        -------
+        int
+            The number of target samples in this dataset.
+        """
+        return len(self.indices)
+
+    def __getitem__(self, index: int) -> Dict[str, DatasetData]:
+        """Returns paired source and target data held by this dataset.
+
+        Parameters
+        ----------
+        index: int
+            The location index to retrieve imagery for.
+
+        Returns
+        -------
+        Tuple[Union[DatasetData, List[DatasetData]], Union[DatasetData, List[DatasetData]]]:
+        A tuple where the first element is list of source data meant
+        to serve as an input to a model. 
+
+        The second element holds target data at the same
+        location. Each sample returned will be a unique pairing of
+        data, but source data may be paired with more than one target
+        and target data and vice-versa. The data will be filtered by
+        any data filters that have been set.
+
+        Depending on the task, some derived classes will potentially
+        return multiple source samples paired with a single target
+        sample, while others, such as the SARToVisible dataset returns
+        a single source sample paired with one or more target sample.
+
+        The DatasetData type is a dictionary that holds sample imagery
+        as well as the image's collection date and the latitude /
+        longitude of the center of the image. The dictionary has keys:
+
+            "image": np.ndarray - The image of interest.
+
+            "data_source": str - The sensor or dataset source of
+            the imagery.
+
+            "bands": List[str] - The data bands that comprise the
+            image channels. If the data source is the Deforestation
+            dataset which does not list multiple data bands, this
+            will be None.
+
+            "lat_lon": Tuple[float, float] - A tuple holding the
+            latitude and longitude in decimal degrees for the center
+            of the image.
+
+            "date": np.datetime64 - The collection date for the image.
+
+        The returned image is a numpy array with shape
+        (C0, H0, W0) where C0 is the image channels, H0 the image
+        height, and W0 the image width. The bit depth of the imagery
+        varies depending on the collecting sensor. The paired target
+        image is also a numpy array with dimensions C1, H1, W1.
+
+        """
+        source_idx, target_idx = self.indices[index]
+        source_data = self.source_data[source_idx["source_ds_idx"]][source_idx["source_img_idx"]]
+        target_data = self.target_data[target_idx["target_ds_idx"]][target_idx["target_img_idx"]]
+        
+        data = {'EO': source_data, 'SAR': target_data}
+                
+        return data
